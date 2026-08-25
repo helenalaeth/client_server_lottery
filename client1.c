@@ -14,7 +14,7 @@
 #pragma comment(lib, "ws2_32.lib")
 
 #define PORT     5000
-#define BUF_SIZE 1024
+#define BUF_SIZE 2048
 
 static SOCKET        g_socket = INVALID_SOCKET;
 static volatile LONG g_terminar = 0;
@@ -71,6 +71,12 @@ int main(void) {
 
     g_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
+    if (g_socket == INVALID_SOCKET) {
+        printf("Erro ao criar socket: %d\n", WSAGetLastError());
+        WSACleanup();
+        return 1;
+    }
+
     struct sockaddr_in serverAddr;
     serverAddr.sin_family = AF_INET;
     serverAddr.sin_port   = htons(PORT);
@@ -90,8 +96,13 @@ int main(void) {
         printf("%s\n", buffer);
     }
 
-    printf("Digite mensagens livres para enviar ao servidor (ou :sair para encerrar).\n");
-    printf("A cada 10 segundos o servidor envia uma atualizacao automatica.\n\n");
+    printf("Comandos disponiveis:\n");
+    printf("  :inicio <N>   -> define o menor numero sorteavel\n");
+    printf("  :fim <N>      -> define o maior numero sorteavel\n");
+    printf("  :qtd <N>      -> define quantos numeros serao sorteados\n");
+    printf("  1 2 3 4 5     -> aposta com numeros separados por espaco\n");
+    printf("  :sair         -> encerra o cliente\n\n");
+    printf("Configuracao padrao (se nao definida): 0 a 100, 5 numeros sorteados.\n\n");
 
     HANDLE hThread1 = CreateThread(NULL, 0, threadEnvia, NULL, 0, NULL);
     HANDLE hThread2 = CreateThread(NULL, 0, threadRecebe, NULL, 0, NULL);
