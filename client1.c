@@ -1,7 +1,14 @@
-/* 
-   Compilar (MSVC): cl client.c ws2_32.lib
-   Compilar (MinGW): gcc client.c -o client.exe -lws2_32
- */
+/*
+   Projeto Pratico 1 - Redes de Computadores
+   Tema: Loteria - CLIENTE
+   Plataforma: Windows (Winsock2)
+
+   Compilar (MinGW):
+       gcc client.c -o client.exe -lws2_32
+
+   Compilar (MSVC - Developer Command Prompt):
+       cl client.c ws2_32.lib
+*/
 
 #define _CRT_SECURE_NO_WARNINGS
 #include <winsock2.h>
@@ -16,10 +23,12 @@
 #define PORT     5000
 #define BUF_SIZE 2048
 
-static SOCKET        g_socket = INVALID_SOCKET;
-static volatile LONG g_terminar = 0;
+static SOCKET          g_socket = INVALID_SOCKET;
+static volatile LONG   g_terminar = 0;
 
-/* THREAD 1: le do teclado e envia pela rede (em loop, ate ":sair") */
+/*
+   THREAD 1 (cliente): le comandos/apostas do teclado e envia pela rede.
+*/
 DWORD WINAPI threadEnvia(LPVOID arg) {
     char buffer[BUF_SIZE];
 
@@ -38,7 +47,9 @@ DWORD WINAPI threadEnvia(LPVOID arg) {
     return 0;
 }
 
-/* THREAD 2: recebe dados do servidor e imprime na tela (em loop infinito) */
+/*
+   THREAD 2 (cliente): recebe dados do servidor (MSG1, sorteios) e imprime.
+*/
 DWORD WINAPI threadRecebe(LPVOID arg) {
     char buffer[BUF_SIZE];
     int n;
@@ -70,7 +81,6 @@ int main(void) {
     if (strlen(serverIp) == 0) strcpy(serverIp, "127.0.0.1");
 
     g_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-
     if (g_socket == INVALID_SOCKET) {
         printf("Erro ao criar socket: %d\n", WSAGetLastError());
         WSACleanup();
@@ -80,7 +90,12 @@ int main(void) {
     struct sockaddr_in serverAddr;
     serverAddr.sin_family = AF_INET;
     serverAddr.sin_port   = htons(PORT);
-    inet_pton(AF_INET, serverIp, &serverAddr.sin_addr);
+    if (inet_pton(AF_INET, serverIp, &serverAddr.sin_addr) != 1) {
+        printf("Endereco IP invalido.\n");
+        closesocket(g_socket);
+        WSACleanup();
+        return 1;
+    }
 
     if (connect(g_socket, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) != 0) {
         printf("Erro ao conectar ao servidor: %d\n", WSAGetLastError());
@@ -89,6 +104,7 @@ int main(void) {
         return 1;
     }
 
+    /* Recebe MSG1 de confirmacao de conexao */
     char buffer[BUF_SIZE];
     int n = recv(g_socket, buffer, BUF_SIZE - 1, 0);
     if (n > 0) {

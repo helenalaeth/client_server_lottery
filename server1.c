@@ -1,4 +1,6 @@
-/* 
+/*
+   Projeto Pratico 1 - Redes de Computadores - Tema: Loteria
+
    Compilar (MSVC): cl server.c ws2_32.lib
    Compilar (MinGW): gcc server.c -o server.exe -lws2_32
 */
@@ -14,11 +16,10 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
-#define PORT     5000
-#define PORT            5000
-#define BUF_SIZE        2048
-#define MAX_APOSTAS     100
-#define MAX_NUMEROS     50
+#define PORT        5000
+#define BUF_SIZE    2048
+#define MAX_APOSTAS 100
+#define MAX_NUMEROS 50
 
 typedef struct {
     int numeros[MAX_NUMEROS];
@@ -31,13 +32,21 @@ typedef struct {
     int qtd;
 } ConfigLoteria;
 
-/*Dados compartilhados entre as duas threads do servidor*/
+/* Dados AINDA compartilhados entre TODOS os clientes (limitacao desta parte) */
 static ConfigLoteria    g_config = { 0, 100, 5 };
 static Aposta           g_apostas[MAX_APOSTAS];
 static int              g_numApostas = 0;
 static CRITICAL_SECTION g_lock;
-static volatile LONG    g_terminar = 0;
-static SOCKET           g_clientSocket = INVALID_SOCKET;
+
+/*
+   Cada conexao tem seu proprio socket e sua propria flag de termino, para
+   que o comando ":sair" de UM cliente nao derrube os demais.
+*/
+typedef struct {
+    SOCKET        socket;
+    int           id;
+    volatile LONG terminar;
+} Conexao;
 
 static void obterHorario(char *buf, size_t tam) {
     time_t t = time(NULL);
@@ -45,20 +54,17 @@ static void obterHorario(char *buf, size_t tam) {
     strftime(buf, tam, "%H:%M:%S", tmInfo);
 }
 
-/* 
-   THREAD 1: loop de leitura do socket. Recebe mensagens do cliente,
-   incrementa o contador em memoria compartilhada (protegido por mutex)
-   e verifica o comando de saida ":sair".
- */
+/* THREAD 1 da conexao: recebe comandos/apostas (na config/lista GLOBAL) */
 DWORD WINAPI threadRecebeCliente(LPVOID arg) {
+    Conexao *con = (Conexao *)arg;
     char buffer[BUF_SIZE];
     int n;
 
-    while (!g_terminar) {
-        n = recv(g_clientSocket, buffer, BUF_SIZE - 1, 0);
+    while (!con->terminar) {
+        n = recv(con->socket, buffer, BUF_SIZE - 1, 0);
         if (n <= 0) {
-            printf("[Servidor] Cliente desconectou.\n");
-            InterlockedExchange(&g_terminar, 1);
+            printf("[Servidor] Cliente #%d desconectou.\n", con->id);
+            InterlockedExchange(&con->terminar, 1);
             break;
         }
         buffer[n] = '\0';
@@ -67,8 +73,8 @@ DWORD WINAPI threadRecebeCliente(LPVOID arg) {
 
         if (buffer[0] == ':') {
             if (_stricmp(buffer, ":sair") == 0) {
-                printf("[Servidor] Cliente solicitou encerramento.\n");
-                InterlockedExchange(&g_terminar, 1);
+                printf("[Servidor] Cliente #%d solicitou encerramento.\n", con->id);
+                InterlockedExchange(&con->terminar, 1);
                 break;
             }
             char cmd[32];
@@ -76,14 +82,13 @@ DWORD WINAPI threadRecebeCliente(LPVOID arg) {
             if (sscanf(buffer, ":%31s %d", cmd, &valor) == 2) {
                 EnterCriticalSection(&g_lock);
                 if (_stricmp(cmd, "inicio") == 0)      g_config.inicio = valor;
-                else if (_stricmp(cmd, "fim") == 0)    g_config.fim    = valor;
-                else if (_stricmp(cmd, "qtd") == 0)    g_config.qtd    = valor;
+                else if (_stricmp(cmd, "fim") == 0)    g_config.fim = valor;
+                else if (_stricmp(cmd, "qtd") == 0)    g_config.qtd = valor;
                 LeaveCriticalSection(&g_lock);
-                printf("[Servidor] Config atualizada -> inicio=%d fim=%d qtd=%d\n",
-                       g_config.inicio, g_config.fim, g_config.qtd);
+                printf("[Servidor] Cliente #%d atualizou config -> inicio=%d fim=%d qtd=%d\n",
+                       con->id, g_config.inicio, g_config.fim, g_config.qtd);
             }
         } else {
-            /* Trata como aposta: numeros separados por espaco */
             EnterCriticalSection(&g_lock);
             if (g_numApostas < MAX_APOSTAS) {
                 Aposta *a = &g_apostas[g_numApostas];
@@ -98,10 +103,8 @@ DWORD WINAPI threadRecebeCliente(LPVOID arg) {
                 }
                 if (a->qtd > 0) {
                     g_numApostas++;
-                    printf("[Servidor] Aposta recebida (%d numeros).\n", a->qtd);
+                    printf("[Servidor] Cliente #%d fez uma aposta (%d numeros).\n", con->id, a->qtd);
                 }
-            } else {
-                printf("[Servidor] Limite de apostas do ciclo atingido, aposta ignorada.\n");
             }
             LeaveCriticalSection(&g_lock);
         }
@@ -109,31 +112,28 @@ DWORD WINAPI threadRecebeCliente(LPVOID arg) {
     return 0;
 }
 
-/*
-   THREAD 2: periodicamente (a cada 10 segundos nesta etapa de teste) le a
-   memoria compartilhada e envia uma atualizacao ao cliente. Na etapa final,
-   esta thread sera substituida pela logica de sorteio a cada 1 minuto.
-*/
-DWORD WINAPI threadSorteio(LPVOID arg) {
-    while (!g_terminar) {
-        /* Espera 1 minuto, verificando a flag de termino a cada segundo */
-        for (int i = 0; i < 60 && !g_terminar; i++) Sleep(1000);
-        if (g_terminar) break;
+/* THREAD 2 da conexao: a cada 1 minuto sorteia (usando a config GLOBAL) e
+   envia o resultado para O SOCKET DESTA conexao */
+DWORD WINAPI threadSorteioCliente(LPVOID arg) {
+    Conexao *con = (Conexao *)arg;
+
+    while (!con->terminar) {
+        for (int i = 0; i < 60 && !con->terminar; i++) Sleep(1000);
+        if (con->terminar) break;
 
         EnterCriticalSection(&g_lock);
         int inicio = g_config.inicio;
-        int fim    = g_config.fim;
+        int fim = g_config.fim;
         int qtdSorteio = g_config.qtd;
         LeaveCriticalSection(&g_lock);
 
         if (qtdSorteio > MAX_NUMEROS) qtdSorteio = MAX_NUMEROS;
         if (fim < inicio) { int t = fim; fim = inicio; inicio = t; }
+        int faixa = fim - inicio + 1;
+        if (qtdSorteio > faixa) qtdSorteio = faixa;
 
         int sorteados[MAX_NUMEROS];
         int total = 0;
-        int faixa = fim - inicio + 1;
-        if (qtdSorteio > faixa) qtdSorteio = faixa; /* nao ha numeros suficientes */
-
         while (total < qtdSorteio) {
             int n = inicio + rand() % faixa;
             int repetido = 0;
@@ -172,12 +172,39 @@ DWORD WINAPI threadSorteio(LPVOID arg) {
                                  "Aposta %d: %d acerto(s) (%s)\n", i + 1, acertos, acertosStr);
             }
         }
-        g_numApostas = 0; /* zera a lista para o proximo ciclo */
+        g_numApostas = 0; /* zera a lista GLOBAL, afetando todos os clientes */
         LeaveCriticalSection(&g_lock);
 
-        send(g_clientSocket, msg, (int)strlen(msg), 0);
-        printf("[Servidor] Sorteio enviado ao cliente:\n%s", msg);
+        send(con->socket, msg, (int)strlen(msg), 0);
+        printf("[Servidor] Sorteio enviado ao cliente #%d.\n", con->id);
     }
+    return 0;
+}
+
+/* Uma thread de trabalho por conexao aceita: envia MSG1 e sobe as 2 threads */
+DWORD WINAPI threadTrabalhoCliente(LPVOID arg) {
+    Conexao *con = (Conexao *)arg;
+
+    char horario[16];
+    obterHorario(horario, sizeof(horario));
+    char msg1[BUF_SIZE];
+    snprintf(msg1, sizeof(msg1), "%s: CONECTADO!!\n", horario);
+    send(con->socket, msg1, (int)strlen(msg1), 0);
+    printf("[Servidor] Cliente #%d conectado.\n", con->id);
+
+    HANDLE hRecv    = CreateThread(NULL, 0, threadRecebeCliente, con, 0, NULL);
+    HANDLE hSorteio = CreateThread(NULL, 0, threadSorteioCliente, con, 0, NULL);
+
+    WaitForSingleObject(hRecv, INFINITE);
+    InterlockedExchange(&con->terminar, 1);
+    WaitForSingleObject(hSorteio, INFINITE);
+
+    CloseHandle(hRecv);
+    CloseHandle(hSorteio);
+    closesocket(con->socket);
+    printf("[Servidor] Cliente #%d removido.\n", con->id);
+
+    free(con);
     return 0;
 }
 
@@ -187,8 +214,8 @@ int main(void) {
         printf("Falha no WSAStartup.\n");
         return 1;
     }
-    InitializeCriticalSection(&g_lock);
     srand((unsigned int)time(NULL));
+    InitializeCriticalSection(&g_lock);
 
     SOCKET listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
@@ -198,39 +225,32 @@ int main(void) {
     serverAddr.sin_port        = htons(PORT);
 
     bind(listenSocket, (struct sockaddr *)&serverAddr, sizeof(serverAddr));
-    listen(listenSocket, 1);
+    listen(listenSocket, SOMAXCONN); /* listen() nao bloqueia, so prepara o socket */
 
-    printf("Servidor de Loteria aguardando conexao na porta %d...\n", PORT);
-    printf("Configuracao padrao: numeros de %d a %d, %d sorteados por rodada.\n",
-       g_config.inicio,
-       g_config.fim,
-       g_config.qtd);
+    printf("Servidor de Loteria (multi-cliente - Parte 1) na porta %d.\n", PORT);
+    printf("Aguardando conexoes...\n");
 
-    struct sockaddr_in clientAddr;
-    int clientAddrSize = sizeof(clientAddr);
-    g_clientSocket = accept(listenSocket, (struct sockaddr *)&clientAddr, &clientAddrSize);
+    int proximoId = 1;
 
-    char horario[16];
-    obterHorario(horario, sizeof(horario));
-    char msg1[BUF_SIZE];
-    snprintf(msg1, sizeof(msg1), "%s: CONECTADO!!\n", horario);
-    send(g_clientSocket, msg1, (int)strlen(msg1), 0);
-    printf("Cliente conectado.\n");
+    /* A thread principal so aceita conexoes e delega o atendimento a uma
+       thread de trabalho, voltando IMEDIATAMENTE ao accept() em seguida. */
+    while (1) {
+        struct sockaddr_in clientAddr;
+        int clientAddrSize = sizeof(clientAddr);
+        SOCKET clientSocket = accept(listenSocket, (struct sockaddr *)&clientAddr, &clientAddrSize);
+        if (clientSocket == INVALID_SOCKET) continue;
 
-    HANDLE hThread1 = CreateThread(NULL, 0, threadRecebeCliente, NULL, 0, NULL);
-    HANDLE hThread2 = CreateThread(NULL, 0, threadSorteio, NULL, 0, NULL);
+        Conexao *con = (Conexao *)malloc(sizeof(Conexao));
+        con->socket = clientSocket;
+        con->id = proximoId++;
+        con->terminar = 0;
 
-    WaitForSingleObject(hThread1, INFINITE);
-    InterlockedExchange(&g_terminar, 1);
-    WaitForSingleObject(hThread2, INFINITE);
+        HANDLE hWorker = CreateThread(NULL, 0, threadTrabalhoCliente, con, 0, NULL);
+        if (hWorker != NULL) CloseHandle(hWorker);
+    }
 
-    CloseHandle(hThread1);
-    CloseHandle(hThread2);
     DeleteCriticalSection(&g_lock);
-    closesocket(g_clientSocket);
     closesocket(listenSocket);
     WSACleanup();
-
-    printf("Servidor encerrado.\n");
     return 0;
 }
