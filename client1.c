@@ -1,4 +1,4 @@
-/*
+/* 
    Projeto Pratico 1 - Redes de Computadores
    Tema: Loteria - CLIENTE
    Plataforma: Windows (Winsock2)
@@ -26,7 +26,7 @@
 static SOCKET          g_socket = INVALID_SOCKET;
 static volatile LONG   g_terminar = 0;
 
-/*
+/* 
    THREAD 1 (cliente): le comandos/apostas do teclado e envia pela rede.
 */
 DWORD WINAPI threadEnvia(LPVOID arg) {
