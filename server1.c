@@ -23,6 +23,12 @@
 #define MAX_NUMEROS         50
 #define MAX_CLIENTES_ARRAY  200
 
+/* 
+   Estrutura com os dados de UM cliente. Cada campo aqui é "instanciado
+   dentro da thread" daquele cliente (nao é mais compartilhado entre
+   clientes diferentes) - apenas as 2 threads do MESMO cliente acessam
+   estes dados, por isso o mutex "lock" é por cliente.
+*/
 typedef struct {
     int numeros[MAX_NUMEROS];
     int qtd;
@@ -36,16 +42,21 @@ typedef struct ClienteInfo {
     int             qtdSorteio;
     Aposta          apostas[MAX_APOSTAS];
     int             numApostas;
-    CRITICAL_SECTION lock;
+    CRITICAL_SECTION lock;         /* protege config/apostas deste cliente */
     volatile LONG   terminar;
     HANDLE          threadRecv;
     HANDLE          threadSorteio;
 } ClienteInfo;
 
+/*
+   Dados COMPARTILHADOS entre TODAS as conexoes: contagem de clientes
+   conectados e a lista de handlers, usados pela thread principal e por
+   todas as threads de trabalho para saber se ha vaga disponivel.
+*/
 static CRITICAL_SECTION g_lockClientes;
 static ClienteInfo      *g_clientes[MAX_CLIENTES_ARRAY];
 static int               g_numConectados = 0;
-static int               g_maxClientes   = 5;
+static int               g_maxClientes   = 5; /* valor padrao, sobrescrito pelo parametro */
 static int               g_proximoId     = 1;
 
 static void obterHorario(char *buf, size_t tam) {
@@ -54,36 +65,11 @@ static void obterHorario(char *buf, size_t tam) {
     strftime(buf, tam, "%H:%M:%S", tmInfo);
 }
 
-/*Traduz os codigos de erro do Winsock mais comuns em mensagens legiveis,
-   usadas para relatar excecoes de rede de forma clara no console.*/
-static const char *descreverErroSocket(int codigo) {
-    switch (codigo) {
-        case WSAECONNRESET:   return "conexao foi reiniciada pelo lado remoto (queda abrupta)";
-        case WSAECONNABORTED: return "conexao foi abortada localmente (falha de rede)";
-        case WSAETIMEDOUT:    return "tempo de espera esgotado (timeout)";
-        case WSAENOTCONN:     return "socket nao estava mais conectado";
-        case WSAENETDOWN:     return "rede local ficou indisponivel";
-        case WSAENETRESET:    return "conexao foi derrubada pela rede";
-        default:              return "erro de rede nao mapeado";
-    }
-}
-
-/* Envia dados verificando o retorno; em caso de falha, reporta a excecao
-   e sinaliza o encerramento da conexao deste cliente. Retorna 1 em caso
-   de sucesso, 0 em caso de falha. */
-static int enviarSeguro(ClienteInfo *cli, const char *msg, int tamanho) {
-    int enviado = send(cli->socket, msg, tamanho, 0);
-    if (enviado == SOCKET_ERROR) {
-        int codigo = WSAGetLastError();
-        printf("[Servidor] Excecao ao enviar dados ao cliente #%d: %s (codigo %d).\n",
-               cli->id, descreverErroSocket(codigo), codigo);
-        InterlockedExchange(&cli->terminar, 1);
-        return 0;
-    }
-    return 1;
-}
-
-/*THREAD 1 do cliente: loop de leitura do socket.*/
+/* 
+   THREAD 1 do cliente: loop de leitura do socket. Recebe comandos
+   (":inicio", ":fim", ":qtd", ":sair") ou apostas (numeros separados por
+   espaco) e atualiza os dados DAQUELE cliente (protegidos pelo lock dele).
+*/
 DWORD WINAPI threadRecebeCliente(LPVOID arg) {
     ClienteInfo *cli = (ClienteInfo *)arg;
     char buffer[BUF_SIZE];
@@ -368,9 +354,9 @@ int main(int argc, char *argv[]) {
 
         HANDLE hWorker = CreateThread(NULL, 0, threadTrabalhoCliente, cli, 0, NULL);
         if (hWorker != NULL) {
-            CloseHandle(hWorker);
+            CloseHandle(hWorker); /* nao precisamos esperar: o worker se auto-gerencia */
         } else {
-            printf("[Servidor] Excecao ao criar thread de trabalho.\n");
+            printf("Erro ao criar thread de trabalho.\n");
             closesocket(clientSocket);
             free(cli);
         }

@@ -26,21 +26,9 @@
 static SOCKET          g_socket = INVALID_SOCKET;
 static volatile LONG   g_terminar = 0;
 
-/* Traduz os codigos de erro do Winsock mais comuns em mensagens legiveis */
-static const char *descreverErroSocket(int codigo) {
-    switch (codigo) {
-        case WSAECONNRESET:   return "conexao foi reiniciada pelo servidor (queda abrupta)";
-        case WSAECONNABORTED: return "conexao foi abortada localmente (falha de rede)";
-        case WSAECONNREFUSED: return "conexao recusada (servidor nao esta rodando ou porta errada)";
-        case WSAETIMEDOUT:    return "tempo de espera esgotado ao tentar conectar";
-        case WSAEHOSTUNREACH: return "host inacessivel";
-        case WSAENETDOWN:     return "rede local ficou indisponivel";
-        case WSAENETUNREACH:  return "rede de destino inacessivel";
-        default:              return "erro de rede nao mapeado";
-    }
-}
-
-/* THREAD 1 (cliente): le comandos/apostas do teclado e envia pela rede */
+/* 
+   THREAD 1 (cliente): le comandos/apostas do teclado e envia pela rede.
+*/
 DWORD WINAPI threadEnvia(LPVOID arg) {
     char buffer[BUF_SIZE];
 

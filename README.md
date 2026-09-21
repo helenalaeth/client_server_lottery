@@ -1,35 +1,93 @@
-# client_server_lottery
+# Projeto Prático 1 — Loteria (Cliente/Servidor com Sockets e Threads)
 
-Este projeto implementa um sistema de loteria baseado em uma arquitetura cliente/servidor, onde usuários podem apostar em números sorteados periodicamente. A aplicação permite a configuração dinâmica dos parâmetros da loteria e a realização de apostas por meio de uma interface cliente que se comunica com o servidor via rede.
+Implementação em **C** usando **Winsock2** para Windows, seguindo a especificação:
+conexão TCP, mensagem `MSG1` (`<HORARIO>: CONECTADO!!`), threads para
+comunicação bidirecional assíncrona, e suporte a múltiplos clientes
+simultâneos (Fase 2).
 
-Funcionamento
-O usuário inicia a conexão com o servidor através do cliente da aplicação e recebe uma mensagem de confirmação no formato:
-"<HORÁRIO>: CONECTADO!!".
+## Arquivos
+- `server.c` — servidor da loteria (multi-cliente)
+- `client.c` — cliente da loteria
 
-Após a conexão, duas threads são criadas tanto no cliente quanto no servidor para gerenciar a comunicação e o processamento das apostas.
+## Como compilar
 
-O usuário pode configurar a loteria enviando comandos via teclado no cliente, utilizando o formato:
+### Opção A — MinGW (gcc)
+```bash
+gcc server.c -o server.exe -lws2_32
+gcc client.c -o client.exe -lws2_32
+```
 
-:inicio <NÚMERO> — define o número inicial do intervalo para o sorteio.
-:fim <NÚMERO> — define o número final do intervalo para o sorteio.
-:qtd <NÚMERO> — define a quantidade de números a serem sorteados.
-Caso a loteria não seja configurada inicialmente, o sistema assume os valores padrão: intervalo de 0 a 100 e 5 números sorteados.
+### Opção B — MSVC (cl.exe)
+Abra o "Developer Command Prompt for VS":
+```bash
+cl server.c ws2_32.lib
+cl client.c ws2_32.lib
+```
 
-Para apostar, o usuário digita números separados por espaços, que são enviados ao servidor para registro.
+> Dica no VS Code: instale a extensão **C/C++** da Microsoft. Se usar MinGW,
+> garanta que o `gcc` esteja no PATH (`gcc --version` deve funcionar no terminal).
 
-A thread 1 do cliente fica responsável por capturar os comandos e apostas do usuário e enviá-los ao servidor continuamente até o momento do sorteio.
+## Como executar
 
-A thread 2 do cliente aguarda mensagens do servidor, exibindo os resultados e informações recebidas.
+O servidor recebe o número máximo de clientes simultâneos como parâmetro de
+linha de comando:
 
-No servidor, a thread 1 recebe e armazena as apostas dos usuários em uma lista, aguardando novas apostas.
+```bash
+server.exe 3
+```
 
-A thread 2 do servidor executa o sorteio a cada 1 minuto, conforme os parâmetros configurados, verifica as apostas feitas, identifica quais números foram acertados e envia os resultados para o cliente.
+Se rodar sem parâmetro, ele usa um limite padrão de 5 clientes e avisa isso
+no terminal.
 
-Após cada sorteio, a lista de apostas é zerada e um novo ciclo de apostas e sorteios é iniciado.
+Depois, abra quantos clientes quiser testar, cada um em um terminal:
 
-Tecnologias Utilizadas
-Comunicação via sockets TCP/IP para conexão cliente/servidor.
-Programação concorrente com threads para gerenciamento simultâneo das conexões e processos.
-Interface de linha de comando para interação do usuário.
-Objetivo
-Este projeto tem como objetivo demonstrar a implementação prática de um sistema distribuído cliente/servidor com comunicação em rede, manipulação de threads e controle de fluxo para um cenário realista de apostas e sorteios.
+```bash
+client.exe
+```
+
+Ele vai perguntar o IP do servidor (use `127.0.0.1` se for na mesma máquina).
+
+Se você tentar conectar mais clientes do que o limite permite, o cliente
+excedente recebe uma mensagem de **"SERVIDOR LOTADO"** em vez do
+`CONECTADO!!`, e a conexão é encerrada automaticamente.
+
+## Como usar (comandos do cliente)
+
+- `:inicio <N>` — define o menor número sorteável
+- `:fim <N>` — define o maior número sorteável
+- `:qtd <N>` — define quantos números serão sorteados por rodada
+- `1 2 3 4 5` — faz uma aposta com números separados por espaço
+- `:sair` — encerra o cliente e a conexão
+
+Se nada for configurado, o padrão é: números de **0 a 100**, **5 sorteados**.
+Cada cliente tem sua própria configuração e lista de apostas — independentes
+dos demais clientes conectados.
+
+A cada **1 minuto**, o servidor sorteia os números daquele cliente, verifica
+quantos números de cada aposta feita no ciclo bateram com o sorteio, envia o
+resultado e reinicia a lista de apostas para o próximo ciclo.
+
+## Como funciona o multi-cliente (Fase 2)
+
+- A thread principal do servidor fica em loop chamando `accept()`. Assim que
+  aceita uma conexão, ela cria uma **thread de trabalho** para aquele
+  cliente e volta imediatamente para o `accept()`, permitindo vários
+  clientes ao mesmo tempo.
+- Essa thread de trabalho verifica se ainda há vaga disponível (respeitando
+  o limite passado por linha de comando). Se não houver, avisa o cliente e
+  encerra a conexão; se houver, registra o cliente e cria as duas threads de
+  serviço dele (recebe apostas/comandos e envia sorteios).
+- Quando um cliente se desconecta (`:sair` ou queda de conexão), sua vaga é
+  liberada automaticamente para outro cliente entrar.
+
+## Observações de implementação
+
+- Cada cliente tem sua própria estrutura de dados (configuração + lista de
+  apostas), protegida por uma `CRITICAL_SECTION` própria — os dois threads
+  daquele cliente (recebe/sorteio) compartilham esse mutex.
+- O número de clientes conectados e a lista de handlers são dados
+  **globais**, compartilhados entre todas as conexões, por isso ficam numa
+  `CRITICAL_SECTION` separada.
+- Cada mensagem de rede é tratada como uma linha (protocolo simplificado,
+  adequado ao escopo do trabalho — não há fragmentação/remontagem de pacotes
+  TCP maiores que o buffer).
