@@ -1,14 +1,14 @@
-/*
+/* ==========================================================================
    Projeto Pratico 1 - Redes de Computadores
    Tema: Loteria - CLIENTE
-   Plataforma: Windows (Winsock2)
-
+   FASE 3 - PARTE 1: deteccao e relato de excecoes de conexao
+   
    Compilar (MinGW):
        gcc client.c -o client.exe -lws2_32
 
    Compilar (MSVC - Developer Command Prompt):
        cl client.c ws2_32.lib
-*/
+   ========================================================================== */
 
 #define _CRT_SECURE_NO_WARNINGS
 #include <winsock2.h>
@@ -26,9 +26,21 @@
 static SOCKET          g_socket = INVALID_SOCKET;
 static volatile LONG   g_terminar = 0;
 
-/*
-   THREAD 1 (cliente): le comandos/apostas do teclado e envia pela rede.
-*/
+/* Traduz os codigos de erro do Winsock mais comuns em mensagens legiveis */
+static const char *descreverErroSocket(int codigo) {
+    switch (codigo) {
+        case WSAECONNRESET:   return "conexao foi reiniciada pelo servidor (queda abrupta)";
+        case WSAECONNABORTED: return "conexao foi abortada localmente (falha de rede)";
+        case WSAECONNREFUSED: return "conexao recusada (servidor nao esta rodando ou porta errada)";
+        case WSAETIMEDOUT:    return "tempo de espera esgotado ao tentar conectar";
+        case WSAEHOSTUNREACH: return "host inacessivel";
+        case WSAENETDOWN:     return "rede local ficou indisponivel";
+        case WSAENETUNREACH:  return "rede de destino inacessivel";
+        default:              return "erro de rede nao mapeado";
+    }
+}
+
+/* THREAD 1 (cliente): le comandos/apostas do teclado e envia pela rede */
 DWORD WINAPI threadEnvia(LPVOID arg) {
     char buffer[BUF_SIZE];
 
@@ -37,7 +49,13 @@ DWORD WINAPI threadEnvia(LPVOID arg) {
         buffer[strcspn(buffer, "\r\n")] = '\0';
         if (strlen(buffer) == 0) continue;
 
-        send(g_socket, buffer, (int)strlen(buffer), 0);
+        if (send(g_socket, buffer, (int)strlen(buffer), 0) == SOCKET_ERROR) {
+            int codigo = WSAGetLastError();
+            printf("\n[Cliente] Excecao ao enviar dados: %s (codigo %d).\n",
+                   descreverErroSocket(codigo), codigo);
+            InterlockedExchange(&g_terminar, 1);
+            break;
+        }
 
         if (_stricmp(buffer, ":sair") == 0) {
             InterlockedExchange(&g_terminar, 1);
@@ -47,17 +65,25 @@ DWORD WINAPI threadEnvia(LPVOID arg) {
     return 0;
 }
 
-/*
-   THREAD 2 (cliente): recebe dados do servidor (MSG1, sorteios) e imprime.
-*/
+/* THREAD 2 (cliente): recebe dados do servidor e imprime na tela */
 DWORD WINAPI threadRecebe(LPVOID arg) {
     char buffer[BUF_SIZE];
     int n;
 
     while (!g_terminar) {
         n = recv(g_socket, buffer, BUF_SIZE - 1, 0);
-        if (n <= 0) {
+        if (n == 0) {
+            /* Desconexao normal: o servidor fechou a conexao de forma limpa
+               (por exemplo, atingiu o limite e recusou, ou foi encerrado) */
             printf("\n[Cliente] Conexao encerrada pelo servidor.\n");
+            InterlockedExchange(&g_terminar, 1);
+            break;
+        }
+        if (n == SOCKET_ERROR) {
+            /* Excecao de rede de verdade */
+            int codigo = WSAGetLastError();
+            printf("\n[Cliente] Excecao de conexao com o servidor: %s (codigo %d).\n",
+                   descreverErroSocket(codigo), codigo);
             InterlockedExchange(&g_terminar, 1);
             break;
         }
@@ -82,7 +108,8 @@ int main(void) {
 
     g_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (g_socket == INVALID_SOCKET) {
-        printf("Erro ao criar socket: %d\n", WSAGetLastError());
+        int codigo = WSAGetLastError();
+        printf("Excecao ao criar socket: %s (codigo %d).\n", descreverErroSocket(codigo), codigo);
         WSACleanup();
         return 1;
     }
@@ -98,7 +125,9 @@ int main(void) {
     }
 
     if (connect(g_socket, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) != 0) {
-        printf("Erro ao conectar ao servidor: %d\n", WSAGetLastError());
+        int codigo = WSAGetLastError();
+        printf("Excecao ao conectar ao servidor: %s (codigo %d).\n",
+               descreverErroSocket(codigo), codigo);
         closesocket(g_socket);
         WSACleanup();
         return 1;
@@ -110,6 +139,18 @@ int main(void) {
     if (n > 0) {
         buffer[n] = '\0';
         printf("%s\n", buffer);
+    } else if (n == 0) {
+        printf("Conexao encerrada pelo servidor antes de receber a confirmacao.\n");
+        closesocket(g_socket);
+        WSACleanup();
+        return 1;
+    } else {
+        int codigo = WSAGetLastError();
+        printf("Excecao ao receber confirmacao do servidor: %s (codigo %d).\n",
+               descreverErroSocket(codigo), codigo);
+        closesocket(g_socket);
+        WSACleanup();
+        return 1;
     }
 
     printf("Comandos disponiveis:\n");

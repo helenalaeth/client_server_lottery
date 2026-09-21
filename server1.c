@@ -1,9 +1,10 @@
-/*
+/* ==========================================================================
    Projeto Pratico 1 - Redes de Computadores - Tema: Loteria
+   FASE 3 - PARTE 1: deteccao e relato de excecoes de conexao (SERVIDOR)
 
    Compilar (MSVC): cl server.c ws2_32.lib
    Compilar (MinGW): gcc server.c -o server.exe -lws2_32
-*/
+   ========================================================================== */
 
 #define _CRT_SECURE_NO_WARNINGS
 #include <winsock2.h>
@@ -16,37 +17,36 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
-#define PORT        5000
-#define BUF_SIZE    2048
-#define MAX_APOSTAS 100
-#define MAX_NUMEROS 50
+#define PORT                5000
+#define BUF_SIZE            2048
+#define MAX_APOSTAS         100
+#define MAX_NUMEROS         50
+#define MAX_CLIENTES_ARRAY  200
 
 typedef struct {
     int numeros[MAX_NUMEROS];
     int qtd;
 } Aposta;
 
-typedef struct {
-    int inicio;
-    int fim;
-    int qtd;
-} ConfigLoteria;
+typedef struct ClienteInfo {
+    SOCKET          socket;
+    int             id;
+    int             inicio;
+    int             fim;
+    int             qtdSorteio;
+    Aposta          apostas[MAX_APOSTAS];
+    int             numApostas;
+    CRITICAL_SECTION lock;
+    volatile LONG   terminar;
+    HANDLE          threadRecv;
+    HANDLE          threadSorteio;
+} ClienteInfo;
 
-/* Dados AINDA compartilhados entre TODOS os clientes (limitacao desta parte) */
-static ConfigLoteria    g_config = { 0, 100, 5 };
-static Aposta           g_apostas[MAX_APOSTAS];
-static int              g_numApostas = 0;
-static CRITICAL_SECTION g_lock;
-
-/*
-   Cada conexao tem seu proprio socket e sua propria flag de termino, para
-   que o comando ":sair" de UM cliente nao derrube os demais.
-*/
-typedef struct {
-    SOCKET        socket;
-    int           id;
-    volatile LONG terminar;
-} Conexao;
+static CRITICAL_SECTION g_lockClientes;
+static ClienteInfo      *g_clientes[MAX_CLIENTES_ARRAY];
+static int               g_numConectados = 0;
+static int               g_maxClientes   = 5;
+static int               g_proximoId     = 1;
 
 static void obterHorario(char *buf, size_t tam) {
     time_t t = time(NULL);
@@ -54,44 +54,85 @@ static void obterHorario(char *buf, size_t tam) {
     strftime(buf, tam, "%H:%M:%S", tmInfo);
 }
 
-/* THREAD 1 da conexao: recebe comandos/apostas (na config/lista GLOBAL) */
+/*Traduz os codigos de erro do Winsock mais comuns em mensagens legiveis,
+   usadas para relatar excecoes de rede de forma clara no console.*/
+static const char *descreverErroSocket(int codigo) {
+    switch (codigo) {
+        case WSAECONNRESET:   return "conexao foi reiniciada pelo lado remoto (queda abrupta)";
+        case WSAECONNABORTED: return "conexao foi abortada localmente (falha de rede)";
+        case WSAETIMEDOUT:    return "tempo de espera esgotado (timeout)";
+        case WSAENOTCONN:     return "socket nao estava mais conectado";
+        case WSAENETDOWN:     return "rede local ficou indisponivel";
+        case WSAENETRESET:    return "conexao foi derrubada pela rede";
+        default:              return "erro de rede nao mapeado";
+    }
+}
+
+/* Envia dados verificando o retorno; em caso de falha, reporta a excecao
+   e sinaliza o encerramento da conexao deste cliente. Retorna 1 em caso
+   de sucesso, 0 em caso de falha. */
+static int enviarSeguro(ClienteInfo *cli, const char *msg, int tamanho) {
+    int enviado = send(cli->socket, msg, tamanho, 0);
+    if (enviado == SOCKET_ERROR) {
+        int codigo = WSAGetLastError();
+        printf("[Servidor] Excecao ao enviar dados ao cliente #%d: %s (codigo %d).\n",
+               cli->id, descreverErroSocket(codigo), codigo);
+        InterlockedExchange(&cli->terminar, 1);
+        return 0;
+    }
+    return 1;
+}
+
+/*THREAD 1 do cliente: loop de leitura do socket.*/
 DWORD WINAPI threadRecebeCliente(LPVOID arg) {
-    Conexao *con = (Conexao *)arg;
+    ClienteInfo *cli = (ClienteInfo *)arg;
     char buffer[BUF_SIZE];
     int n;
 
-    while (!con->terminar) {
-        n = recv(con->socket, buffer, BUF_SIZE - 1, 0);
-        if (n <= 0) {
-            printf("[Servidor] Cliente #%d desconectou.\n", con->id);
-            InterlockedExchange(&con->terminar, 1);
+    while (!cli->terminar) {
+        n = recv(cli->socket, buffer, BUF_SIZE - 1, 0);
+        if (n == 0) {
+            /* Desconexao normal: o cliente fechou a conexao de forma limpa
+               (por exemplo, ele encerrou o processo sem mandar ":sair") */
+            printf("[Servidor] Cliente #%d desconectou (conexao fechada pelo cliente"
+                   " sem solicitacao explicita).\n", cli->id);
+            InterlockedExchange(&cli->terminar, 1);
             break;
         }
+        if (n == SOCKET_ERROR) {
+            /* Excecao de rede de verdade (nao e so um fechamento normal) */
+            int codigo = WSAGetLastError();
+            printf("[Servidor] Excecao de conexao com o cliente #%d: %s (codigo %d).\n",
+                   cli->id, descreverErroSocket(codigo), codigo);
+            InterlockedExchange(&cli->terminar, 1);
+            break;
+        }
+
         buffer[n] = '\0';
         buffer[strcspn(buffer, "\r\n")] = '\0';
         if (strlen(buffer) == 0) continue;
 
         if (buffer[0] == ':') {
             if (_stricmp(buffer, ":sair") == 0) {
-                printf("[Servidor] Cliente #%d solicitou encerramento.\n", con->id);
-                InterlockedExchange(&con->terminar, 1);
+                printf("[Servidor] Cliente #%d solicitou encerramento.\n", cli->id);
+                InterlockedExchange(&cli->terminar, 1);
                 break;
             }
             char cmd[32];
             int valor;
             if (sscanf(buffer, ":%31s %d", cmd, &valor) == 2) {
-                EnterCriticalSection(&g_lock);
-                if (_stricmp(cmd, "inicio") == 0)      g_config.inicio = valor;
-                else if (_stricmp(cmd, "fim") == 0)    g_config.fim = valor;
-                else if (_stricmp(cmd, "qtd") == 0)    g_config.qtd = valor;
-                LeaveCriticalSection(&g_lock);
+                EnterCriticalSection(&cli->lock);
+                if (_stricmp(cmd, "inicio") == 0)      cli->inicio = valor;
+                else if (_stricmp(cmd, "fim") == 0)    cli->fim = valor;
+                else if (_stricmp(cmd, "qtd") == 0)    cli->qtdSorteio = valor;
+                LeaveCriticalSection(&cli->lock);
                 printf("[Servidor] Cliente #%d atualizou config -> inicio=%d fim=%d qtd=%d\n",
-                       con->id, g_config.inicio, g_config.fim, g_config.qtd);
+                       cli->id, cli->inicio, cli->fim, cli->qtdSorteio);
             }
         } else {
-            EnterCriticalSection(&g_lock);
-            if (g_numApostas < MAX_APOSTAS) {
-                Aposta *a = &g_apostas[g_numApostas];
+            EnterCriticalSection(&cli->lock);
+            if (cli->numApostas < MAX_APOSTAS) {
+                Aposta *a = &cli->apostas[cli->numApostas];
                 a->qtd = 0;
                 char tmp[BUF_SIZE];
                 strncpy(tmp, buffer, BUF_SIZE - 1);
@@ -102,30 +143,29 @@ DWORD WINAPI threadRecebeCliente(LPVOID arg) {
                     tok = strtok(NULL, " ");
                 }
                 if (a->qtd > 0) {
-                    g_numApostas++;
-                    printf("[Servidor] Cliente #%d fez uma aposta (%d numeros).\n", con->id, a->qtd);
+                    cli->numApostas++;
+                    printf("[Servidor] Cliente #%d fez uma aposta (%d numeros).\n", cli->id, a->qtd);
                 }
             }
-            LeaveCriticalSection(&g_lock);
+            LeaveCriticalSection(&cli->lock);
         }
     }
     return 0;
 }
 
-/* THREAD 2 da conexao: a cada 1 minuto sorteia (usando a config GLOBAL) e
-   envia o resultado para O SOCKET DESTA conexao */
+/*THREAD 2 do cliente: a cada 1 minuto sorteia e envia o resultado.*/
 DWORD WINAPI threadSorteioCliente(LPVOID arg) {
-    Conexao *con = (Conexao *)arg;
+    ClienteInfo *cli = (ClienteInfo *)arg;
 
-    while (!con->terminar) {
-        for (int i = 0; i < 60 && !con->terminar; i++) Sleep(1000);
-        if (con->terminar) break;
+    while (!cli->terminar) {
+        for (int i = 0; i < 60 && !cli->terminar; i++) Sleep(1000);
+        if (cli->terminar) break;
 
-        EnterCriticalSection(&g_lock);
-        int inicio = g_config.inicio;
-        int fim = g_config.fim;
-        int qtdSorteio = g_config.qtd;
-        LeaveCriticalSection(&g_lock);
+        EnterCriticalSection(&cli->lock);
+        int inicio = cli->inicio;
+        int fim    = cli->fim;
+        int qtdSorteio = cli->qtdSorteio;
+        LeaveCriticalSection(&cli->lock);
 
         if (qtdSorteio > MAX_NUMEROS) qtdSorteio = MAX_NUMEROS;
         if (fim < inicio) { int t = fim; fim = inicio; inicio = t; }
@@ -149,20 +189,20 @@ DWORD WINAPI threadSorteioCliente(LPVOID arg) {
             pos += snprintf(msg + pos, sizeof(msg) - pos, " %d", sorteados[i]);
         pos += snprintf(msg + pos, sizeof(msg) - pos, "\n");
 
-        EnterCriticalSection(&g_lock);
-        if (g_numApostas == 0) {
+        EnterCriticalSection(&cli->lock);
+        if (cli->numApostas == 0) {
             pos += snprintf(msg + pos, sizeof(msg) - pos,
                              "Nenhuma aposta foi feita neste ciclo.\n");
         } else {
-            for (int i = 0; i < g_numApostas; i++) {
+            for (int i = 0; i < cli->numApostas; i++) {
                 int acertos = 0;
                 char acertosStr[256] = "";
-                for (int j = 0; j < g_apostas[i].qtd; j++) {
+                for (int j = 0; j < cli->apostas[i].qtd; j++) {
                     for (int k = 0; k < total; k++) {
-                        if (g_apostas[i].numeros[j] == sorteados[k]) {
+                        if (cli->apostas[i].numeros[j] == sorteados[k]) {
                             acertos++;
                             char tmp[16];
-                            snprintf(tmp, sizeof(tmp), "%d ", g_apostas[i].numeros[j]);
+                            snprintf(tmp, sizeof(tmp), "%d ", cli->apostas[i].numeros[j]);
                             strncat(acertosStr, tmp, sizeof(acertosStr) - strlen(acertosStr) - 1);
                             break;
                         }
@@ -172,84 +212,171 @@ DWORD WINAPI threadSorteioCliente(LPVOID arg) {
                                  "Aposta %d: %d acerto(s) (%s)\n", i + 1, acertos, acertosStr);
             }
         }
-        g_numApostas = 0; /* zera a lista GLOBAL, afetando todos os clientes */
-        LeaveCriticalSection(&g_lock);
+        cli->numApostas = 0;
+        LeaveCriticalSection(&cli->lock);
 
-        send(con->socket, msg, (int)strlen(msg), 0);
-        printf("[Servidor] Sorteio enviado ao cliente #%d.\n", con->id);
+        /* Envio verificado: se o cliente ja caiu, isso e detectado aqui
+           tambem, e nao so pela thread de recebimento. */
+        enviarSeguro(cli, msg, (int)strlen(msg));
     }
     return 0;
 }
 
-/* Uma thread de trabalho por conexao aceita: envia MSG1 e sobe as 2 threads */
 DWORD WINAPI threadTrabalhoCliente(LPVOID arg) {
-    Conexao *con = (Conexao *)arg;
-
+    ClienteInfo *cli = (ClienteInfo *)arg;
     char horario[16];
+    char msg[BUF_SIZE];
+    int slot = -1;
+
+    EnterCriticalSection(&g_lockClientes);
+    if (g_numConectados >= g_maxClientes) {
+        LeaveCriticalSection(&g_lockClientes);
+
+        obterHorario(horario, sizeof(horario));
+        snprintf(msg, sizeof(msg),
+                 "%s: SERVIDOR LOTADO! Limite de %d cliente(s) atingido. Tente novamente mais tarde.\n",
+                 horario, g_maxClientes);
+        if (send(cli->socket, msg, (int)strlen(msg), 0) == SOCKET_ERROR) {
+            printf("[Servidor] Excecao ao avisar cliente recusado: codigo %d.\n", WSAGetLastError());
+        }
+        printf("[Servidor] Conexao recusada: limite de %d clientes atingido.\n", g_maxClientes);
+
+        closesocket(cli->socket);
+        free(cli);
+        return 0;
+    }
+
+    for (int i = 0; i < MAX_CLIENTES_ARRAY; i++) {
+        if (g_clientes[i] == NULL) { slot = i; break; }
+    }
+    cli->id = g_proximoId++;
+    if (slot >= 0) g_clientes[slot] = cli;
+    g_numConectados++;
+    int totalConectados = g_numConectados;
+    LeaveCriticalSection(&g_lockClientes);
+
+    cli->inicio = 0;
+    cli->fim = 100;
+    cli->qtdSorteio = 5;
+    cli->numApostas = 0;
+    cli->terminar = 0;
+    InitializeCriticalSection(&cli->lock);
+
     obterHorario(horario, sizeof(horario));
-    char msg1[BUF_SIZE];
-    snprintf(msg1, sizeof(msg1), "%s: CONECTADO!!\n", horario);
-    send(con->socket, msg1, (int)strlen(msg1), 0);
-    printf("[Servidor] Cliente #%d conectado.\n", con->id);
+    snprintf(msg, sizeof(msg), "%s: CONECTADO!!\n", horario);
+    if (!enviarSeguro(cli, msg, (int)strlen(msg))) {
+        /* Excecao logo na primeira mensagem: cliente ja caiu antes de
+           conseguirmos avisar. Segue o fluxo normal de limpeza abaixo. */
+    }
+    printf("[Servidor] Cliente #%d conectado. (%d/%d vagas em uso)\n",
+           cli->id, totalConectados, g_maxClientes);
 
-    HANDLE hRecv    = CreateThread(NULL, 0, threadRecebeCliente, con, 0, NULL);
-    HANDLE hSorteio = CreateThread(NULL, 0, threadSorteioCliente, con, 0, NULL);
+    cli->threadRecv    = CreateThread(NULL, 0, threadRecebeCliente, cli, 0, NULL);
+    cli->threadSorteio = CreateThread(NULL, 0, threadSorteioCliente, cli, 0, NULL);
 
-    WaitForSingleObject(hRecv, INFINITE);
-    InterlockedExchange(&con->terminar, 1);
-    WaitForSingleObject(hSorteio, INFINITE);
+    WaitForSingleObject(cli->threadRecv, INFINITE);
+    InterlockedExchange(&cli->terminar, 1);
+    WaitForSingleObject(cli->threadSorteio, INFINITE);
 
-    CloseHandle(hRecv);
-    CloseHandle(hSorteio);
-    closesocket(con->socket);
-    printf("[Servidor] Cliente #%d removido.\n", con->id);
+    CloseHandle(cli->threadRecv);
+    CloseHandle(cli->threadSorteio);
+    DeleteCriticalSection(&cli->lock);
+    closesocket(cli->socket);
 
-    free(con);
+    EnterCriticalSection(&g_lockClientes);
+    for (int i = 0; i < MAX_CLIENTES_ARRAY; i++) {
+        if (g_clientes[i] == cli) { g_clientes[i] = NULL; break; }
+    }
+    g_numConectados--;
+    int restantes = g_numConectados;
+    LeaveCriticalSection(&g_lockClientes);
+
+    printf("[Servidor] Cliente #%d removido. (%d/%d vagas em uso)\n",
+           cli->id, restantes, g_maxClientes);
+
+    free(cli);
     return 0;
 }
 
-int main(void) {
+int main(int argc, char *argv[]) {
+    if (argc >= 2) {
+        int valor = atoi(argv[1]);
+        if (valor > 0) g_maxClientes = valor;
+        else printf("Parametro invalido, usando limite padrao de %d clientes.\n", g_maxClientes);
+    } else {
+        printf("Uso: %s <numero_maximo_de_clientes>\n", argv[0]);
+        printf("Nenhum parametro informado, usando limite padrao de %d clientes.\n", g_maxClientes);
+    }
+
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
         printf("Falha no WSAStartup.\n");
         return 1;
     }
     srand((unsigned int)time(NULL));
-    InitializeCriticalSection(&g_lock);
+    InitializeCriticalSection(&g_lockClientes);
+    memset(g_clientes, 0, sizeof(g_clientes));
 
     SOCKET listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listenSocket == INVALID_SOCKET) {
+        printf("Erro ao criar socket: %d\n", WSAGetLastError());
+        WSACleanup();
+        return 1;
+    }
 
     struct sockaddr_in serverAddr;
     serverAddr.sin_family      = AF_INET;
     serverAddr.sin_addr.s_addr = INADDR_ANY;
     serverAddr.sin_port        = htons(PORT);
 
-    bind(listenSocket, (struct sockaddr *)&serverAddr, sizeof(serverAddr));
-    listen(listenSocket, SOMAXCONN); /* listen() nao bloqueia, so prepara o socket */
+    if (bind(listenSocket, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+        printf("Erro no bind: %d\n", WSAGetLastError());
+        closesocket(listenSocket);
+        WSACleanup();
+        return 1;
+    }
 
-    printf("Servidor de Loteria (multi-cliente - Parte 1) na porta %d.\n", PORT);
+    if (listen(listenSocket, SOMAXCONN) == SOCKET_ERROR) {
+        printf("Erro no listen: %d\n", WSAGetLastError());
+        closesocket(listenSocket);
+        WSACleanup();
+        return 1;
+    }
+
+    printf("Servidor de Loteria (multi-cliente) na porta %d. Limite: %d clientes.\n",
+           PORT, g_maxClientes);
     printf("Aguardando conexoes...\n");
 
-    int proximoId = 1;
-
-    /* A thread principal so aceita conexoes e delega o atendimento a uma
-       thread de trabalho, voltando IMEDIATAMENTE ao accept() em seguida. */
     while (1) {
         struct sockaddr_in clientAddr;
         int clientAddrSize = sizeof(clientAddr);
         SOCKET clientSocket = accept(listenSocket, (struct sockaddr *)&clientAddr, &clientAddrSize);
-        if (clientSocket == INVALID_SOCKET) continue;
+        if (clientSocket == INVALID_SOCKET) {
+            printf("Excecao no accept: codigo %d. Continuando a aguardar conexoes...\n",
+                   WSAGetLastError());
+            continue;
+        }
 
-        Conexao *con = (Conexao *)malloc(sizeof(Conexao));
-        con->socket = clientSocket;
-        con->id = proximoId++;
-        con->terminar = 0;
+        ClienteInfo *cli = (ClienteInfo *)malloc(sizeof(ClienteInfo));
+        if (cli == NULL) {
+            printf("[Servidor] Excecao: falha ao alocar memoria para novo cliente.\n");
+            closesocket(clientSocket);
+            continue;
+        }
+        memset(cli, 0, sizeof(ClienteInfo));
+        cli->socket = clientSocket;
 
-        HANDLE hWorker = CreateThread(NULL, 0, threadTrabalhoCliente, con, 0, NULL);
-        if (hWorker != NULL) CloseHandle(hWorker);
+        HANDLE hWorker = CreateThread(NULL, 0, threadTrabalhoCliente, cli, 0, NULL);
+        if (hWorker != NULL) {
+            CloseHandle(hWorker);
+        } else {
+            printf("[Servidor] Excecao ao criar thread de trabalho.\n");
+            closesocket(clientSocket);
+            free(cli);
+        }
     }
 
-    DeleteCriticalSection(&g_lock);
+    DeleteCriticalSection(&g_lockClientes);
     closesocket(listenSocket);
     WSACleanup();
     return 0;
