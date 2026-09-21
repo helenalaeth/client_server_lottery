@@ -1,14 +1,24 @@
-/* ==========================================================================
+/*
    Projeto Pratico 1 - Redes de Computadores
    Tema: Loteria - CLIENTE
-   FASE 3 - PARTE 1: deteccao e relato de excecoes de conexao
-   
+   FASE 3 - PARTE 2: blindagem final
+
+   - A thread que le o teclado nao fica mais bloqueada indefinidamente em
+     fgets(). Em vez disso, ela espera por ate 200ms de cada vez usando
+     WaitForSingleObject no handle de entrada do console, verificando a
+     flag de termino a cada ciclo. Assim, quando a OUTRA thread detecta
+     que o servidor caiu (ou a conexao teve uma excecao), esta thread
+     percebe isso rapidamente e o processo do cliente encerra sozinho,
+     em vez de ficar preso esperando o usuario apertar Enter.
+   - Isso completa o requisito da Fase 3 de que nem cliente nem servidor
+     fiquem travados ou em estado inconsistente apos uma excecao.
+
    Compilar (MinGW):
        gcc client.c -o client.exe -lws2_32
 
    Compilar (MSVC - Developer Command Prompt):
        cl client.c ws2_32.lib
-   ========================================================================== */
+*/
 
 #define _CRT_SECURE_NO_WARNINGS
 #include <winsock2.h>
@@ -26,13 +36,37 @@
 static SOCKET          g_socket = INVALID_SOCKET;
 static volatile LONG   g_terminar = 0;
 
-/* 
+static const char *descreverErroSocket(int codigo) {
+    switch (codigo) {
+        case WSAECONNRESET:   return "conexao foi reiniciada pelo servidor (queda abrupta)";
+        case WSAECONNABORTED: return "conexao foi abortada localmente (falha de rede)";
+        case WSAECONNREFUSED: return "conexao recusada (servidor nao esta rodando ou porta errada)";
+        case WSAETIMEDOUT:    return "tempo de espera esgotado ao tentar conectar";
+        case WSAEHOSTUNREACH: return "host inacessivel";
+        case WSAENETDOWN:     return "rede local ficou indisponivel";
+        case WSAENETUNREACH:  return "rede de destino inacessivel";
+        default:              return "erro de rede nao mapeado";
+    }
+}
+
+/*
    THREAD 1 (cliente): le comandos/apostas do teclado e envia pela rede.
+   Usa uma espera CANCELAVEL (com timeout curto) em vez de um fgets()
+   bloqueante puro, para poder perceber rapidamente quando a outra thread
+   sinaliza o termino (por exemplo, apos uma queda de conexao).
 */
 DWORD WINAPI threadEnvia(LPVOID arg) {
     char buffer[BUF_SIZE];
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
 
     while (!g_terminar) {
+        /* Espera ate 200ms por uma tecla; se nao vier nada, volta a
+           checar a flag de termino e tenta de novo (loop nao-bloqueante) */
+        if (hStdin != INVALID_HANDLE_VALUE) {
+            DWORD resultado = WaitForSingleObject(hStdin, 200);
+            if (resultado != WAIT_OBJECT_0) continue;
+        }
+
         if (fgets(buffer, BUF_SIZE, stdin) == NULL) continue;
         buffer[strcspn(buffer, "\r\n")] = '\0';
         if (strlen(buffer) == 0) continue;
@@ -61,14 +95,11 @@ DWORD WINAPI threadRecebe(LPVOID arg) {
     while (!g_terminar) {
         n = recv(g_socket, buffer, BUF_SIZE - 1, 0);
         if (n == 0) {
-            /* Desconexao normal: o servidor fechou a conexao de forma limpa
-               (por exemplo, atingiu o limite e recusou, ou foi encerrado) */
             printf("\n[Cliente] Conexao encerrada pelo servidor.\n");
             InterlockedExchange(&g_terminar, 1);
             break;
         }
         if (n == SOCKET_ERROR) {
-            /* Excecao de rede de verdade */
             int codigo = WSAGetLastError();
             printf("\n[Cliente] Excecao de conexao com o servidor: %s (codigo %d).\n",
                    descreverErroSocket(codigo), codigo);

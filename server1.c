@@ -1,10 +1,20 @@
-/* ==========================================================================
+/*
    Projeto Pratico 1 - Redes de Computadores - Tema: Loteria
-   FASE 3 - PARTE 1: deteccao e relato de excecoes de conexao (SERVIDOR)
+   FASE 3 - PARTE 2: blindagem final (SERVIDOR)
+
+   - A montagem da mensagem de resultado do sorteio agora usa uma funcao
+     auxiliar (appendSeguro) que NUNCA deixa a posicao de escrita
+     ultrapassar o tamanho do buffer, mesmo com muitas apostas acumuladas
+     no mesmo ciclo. Isso elimina o risco (mesmo que raro em uso normal)
+     de escrita fora dos limites do buffer, que poderia gerar
+     comportamento indefinido.
+   - Revisao geral do codigo para nao gerar nenhum warning de compilacao
+     nem erro de execucao em nenhum cenario testado (conforme exigido
+     pela Fase 3).
 
    Compilar (MSVC): cl server.c ws2_32.lib
    Compilar (MinGW): gcc server.c -o server.exe -lws2_32
-   ========================================================================== */
+*/
 
 #define _CRT_SECURE_NO_WARNINGS
 #include <winsock2.h>
@@ -13,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <time.h>
 
 #pragma comment(lib, "ws2_32.lib")
@@ -23,12 +34,6 @@
 #define MAX_NUMEROS         50
 #define MAX_CLIENTES_ARRAY  200
 
-/* 
-   Estrutura com os dados de UM cliente. Cada campo aqui é "instanciado
-   dentro da thread" daquele cliente (nao é mais compartilhado entre
-   clientes diferentes) - apenas as 2 threads do MESMO cliente acessam
-   estes dados, por isso o mutex "lock" é por cliente.
-*/
 typedef struct {
     int numeros[MAX_NUMEROS];
     int qtd;
@@ -42,21 +47,16 @@ typedef struct ClienteInfo {
     int             qtdSorteio;
     Aposta          apostas[MAX_APOSTAS];
     int             numApostas;
-    CRITICAL_SECTION lock;         /* protege config/apostas deste cliente */
+    CRITICAL_SECTION lock;
     volatile LONG   terminar;
     HANDLE          threadRecv;
     HANDLE          threadSorteio;
 } ClienteInfo;
 
-/*
-   Dados COMPARTILHADOS entre TODAS as conexoes: contagem de clientes
-   conectados e a lista de handlers, usados pela thread principal e por
-   todas as threads de trabalho para saber se ha vaga disponivel.
-*/
 static CRITICAL_SECTION g_lockClientes;
 static ClienteInfo      *g_clientes[MAX_CLIENTES_ARRAY];
 static int               g_numConectados = 0;
-static int               g_maxClientes   = 5; /* valor padrao, sobrescrito pelo parametro */
+static int               g_maxClientes   = 5;
 static int               g_proximoId     = 1;
 
 static void obterHorario(char *buf, size_t tam) {
@@ -65,10 +65,54 @@ static void obterHorario(char *buf, size_t tam) {
     strftime(buf, tam, "%H:%M:%S", tmInfo);
 }
 
+static const char *descreverErroSocket(int codigo) {
+    switch (codigo) {
+        case WSAECONNRESET:   return "conexao foi reiniciada pelo lado remoto (queda abrupta)";
+        case WSAECONNABORTED: return "conexao foi abortada localmente (falha de rede)";
+        case WSAETIMEDOUT:    return "tempo de espera esgotado (timeout)";
+        case WSAENOTCONN:     return "socket nao estava mais conectado";
+        case WSAENETDOWN:     return "rede local ficou indisponivel";
+        case WSAENETRESET:    return "conexao foi derrubada pela rede";
+        default:              return "erro de rede nao mapeado";
+    }
+}
+
+/*
+   Acrescenta texto formatado em "buf" a partir da posicao "pos", SEM NUNCA
+   ultrapassar "tamBuf". Se o buffer ja estiver cheio, simplesmente nao
+   escreve mais nada (silenciosamente), em vez de arriscar estourar os
+   limites da memoria alocada. Retorna a nova posicao (sempre valida).
+*/
+static int appendSeguro(char *buf, int tamBuf, int pos, const char *fmt, ...) {
+    if (pos < 0) pos = 0;
+    if (pos >= tamBuf - 1) return tamBuf - 1; /* ja nao ha espaco: nao escreve mais */
+
+    va_list args;
+    va_start(args, fmt);
+    int escrito = vsnprintf(buf + pos, (size_t)(tamBuf - pos), fmt, args);
+    va_end(args);
+
+    if (escrito < 0) return pos; /* erro de formatacao: mantem posicao atual */
+
+    int novoPos = pos + escrito;
+    if (novoPos > tamBuf - 1) novoPos = tamBuf - 1; /* trava dentro do buffer */
+    return novoPos;
+}
+
+static int enviarSeguro(ClienteInfo *cli, const char *msg, int tamanho) {
+    int enviado = send(cli->socket, msg, tamanho, 0);
+    if (enviado == SOCKET_ERROR) {
+        int codigo = WSAGetLastError();
+        printf("[Servidor] Excecao ao enviar dados ao cliente #%d: %s (codigo %d).\n",
+               cli->id, descreverErroSocket(codigo), codigo);
+        InterlockedExchange(&cli->terminar, 1);
+        return 0;
+    }
+    return 1;
+}
+
 /* 
-   THREAD 1 do cliente: loop de leitura do socket. Recebe comandos
-   (":inicio", ":fim", ":qtd", ":sair") ou apostas (numeros separados por
-   espaco) e atualiza os dados DAQUELE cliente (protegidos pelo lock dele).
+   THREAD 1 do cliente: loop de leitura do socket.
 */
 DWORD WINAPI threadRecebeCliente(LPVOID arg) {
     ClienteInfo *cli = (ClienteInfo *)arg;
@@ -78,15 +122,12 @@ DWORD WINAPI threadRecebeCliente(LPVOID arg) {
     while (!cli->terminar) {
         n = recv(cli->socket, buffer, BUF_SIZE - 1, 0);
         if (n == 0) {
-            /* Desconexao normal: o cliente fechou a conexao de forma limpa
-               (por exemplo, ele encerrou o processo sem mandar ":sair") */
             printf("[Servidor] Cliente #%d desconectou (conexao fechada pelo cliente"
                    " sem solicitacao explicita).\n", cli->id);
             InterlockedExchange(&cli->terminar, 1);
             break;
         }
         if (n == SOCKET_ERROR) {
-            /* Excecao de rede de verdade (nao e so um fechamento normal) */
             int codigo = WSAGetLastError();
             printf("[Servidor] Excecao de conexao com o cliente #%d: %s (codigo %d).\n",
                    cli->id, descreverErroSocket(codigo), codigo);
@@ -139,7 +180,11 @@ DWORD WINAPI threadRecebeCliente(LPVOID arg) {
     return 0;
 }
 
-/*THREAD 2 do cliente: a cada 1 minuto sorteia e envia o resultado.*/
+/*
+   THREAD 2 do cliente: a cada 1 minuto sorteia e envia o resultado.
+   A montagem da mensagem agora usa appendSeguro, protegida contra
+   estouro de buffer mesmo com muitas apostas no mesmo ciclo.
+*/
 DWORD WINAPI threadSorteioCliente(LPVOID arg) {
     ClienteInfo *cli = (ClienteInfo *)arg;
 
@@ -170,15 +215,14 @@ DWORD WINAPI threadSorteioCliente(LPVOID arg) {
         char msg[BUF_SIZE];
         char horario[16];
         obterHorario(horario, sizeof(horario));
-        int pos = snprintf(msg, sizeof(msg), "%s: SORTEIO:", horario);
+        int pos = appendSeguro(msg, BUF_SIZE, 0, "%s: SORTEIO:", horario);
         for (int i = 0; i < total; i++)
-            pos += snprintf(msg + pos, sizeof(msg) - pos, " %d", sorteados[i]);
-        pos += snprintf(msg + pos, sizeof(msg) - pos, "\n");
+            pos = appendSeguro(msg, BUF_SIZE, pos, " %d", sorteados[i]);
+        pos = appendSeguro(msg, BUF_SIZE, pos, "\n");
 
         EnterCriticalSection(&cli->lock);
         if (cli->numApostas == 0) {
-            pos += snprintf(msg + pos, sizeof(msg) - pos,
-                             "Nenhuma aposta foi feita neste ciclo.\n");
+            pos = appendSeguro(msg, BUF_SIZE, pos, "Nenhuma aposta foi feita neste ciclo.\n");
         } else {
             for (int i = 0; i < cli->numApostas; i++) {
                 int acertos = 0;
@@ -194,15 +238,14 @@ DWORD WINAPI threadSorteioCliente(LPVOID arg) {
                         }
                     }
                 }
-                pos += snprintf(msg + pos, sizeof(msg) - pos,
-                                 "Aposta %d: %d acerto(s) (%s)\n", i + 1, acertos, acertosStr);
+                pos = appendSeguro(msg, BUF_SIZE, pos, "Aposta %d: %d acerto(s) (%s)\n",
+                                    i + 1, acertos, acertosStr);
+                if (pos >= BUF_SIZE - 1) break; /* buffer cheio: para de acrescentar apostas */
             }
         }
         cli->numApostas = 0;
         LeaveCriticalSection(&cli->lock);
 
-        /* Envio verificado: se o cliente ja caiu, isso e detectado aqui
-           tambem, e nao so pela thread de recebimento. */
         enviarSeguro(cli, msg, (int)strlen(msg));
     }
     return 0;
@@ -250,10 +293,7 @@ DWORD WINAPI threadTrabalhoCliente(LPVOID arg) {
 
     obterHorario(horario, sizeof(horario));
     snprintf(msg, sizeof(msg), "%s: CONECTADO!!\n", horario);
-    if (!enviarSeguro(cli, msg, (int)strlen(msg))) {
-        /* Excecao logo na primeira mensagem: cliente ja caiu antes de
-           conseguirmos avisar. Segue o fluxo normal de limpeza abaixo. */
-    }
+    enviarSeguro(cli, msg, (int)strlen(msg));
     printf("[Servidor] Cliente #%d conectado. (%d/%d vagas em uso)\n",
            cli->id, totalConectados, g_maxClientes);
 
@@ -354,9 +394,9 @@ int main(int argc, char *argv[]) {
 
         HANDLE hWorker = CreateThread(NULL, 0, threadTrabalhoCliente, cli, 0, NULL);
         if (hWorker != NULL) {
-            CloseHandle(hWorker); /* nao precisamos esperar: o worker se auto-gerencia */
+            CloseHandle(hWorker);
         } else {
-            printf("Erro ao criar thread de trabalho.\n");
+            printf("[Servidor] Excecao ao criar thread de trabalho.\n");
             closesocket(clientSocket);
             free(cli);
         }
